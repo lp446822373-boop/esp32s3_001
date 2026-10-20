@@ -10,6 +10,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
 
@@ -20,20 +21,30 @@
 
 #define TERMINAL_SCAN_PATH "/api/v1/terminal/scan"
 #define TERMINAL_HEARTBEAT_PATH "/api/v1/terminal/heartbeat"
+#define TERMINAL_PENDING_PATH "/api/v1/terminal/pending/"
 
 #define TERMINAL_TOKEN_MAX 128
 #define TERMINAL_QUEUE_DEPTH 4
 #define TERMINAL_RESP_MAX 1024
+#define TERMINAL_PENDING_ID_MAX 64
+#define TERMINAL_PENDING_MAX 4
 
 #define TERMINAL_SCAN_TIMEOUT_MS 10000
 #define TERMINAL_HEARTBEAT_TIMEOUT_MS 5000
 #define TERMINAL_HEARTBEAT_INTERVAL_MS 10000
 #define TERMINAL_HEARTBEAT_RETRY_MS 5000
 
+/* 待确认请求：文档建议每 2 秒查询一次；服务端无最终结果时按超时放弃跟踪 */
+#define TERMINAL_PENDING_QUERY_INTERVAL_MS 2000
+#define TERMINAL_PENDING_QUERY_TIMEOUT_MS 5000
+#define TERMINAL_PENDING_MAX_DURATION_US (10 * 60 * 1000 * 1000LL)
+
 #define TERMINAL_SCAN_TASK_STACK 8192
 #define TERMINAL_HEARTBEAT_TASK_STACK 8192
+#define TERMINAL_PENDING_TASK_STACK 8192
 #define TERMINAL_SCAN_TASK_PRIO 6
 #define TERMINAL_HEARTBEAT_TASK_PRIO 5
+#define TERMINAL_PENDING_TASK_PRIO 4
 
 /* Kconfig 未生成时保持静默，方便在旧配置下编译 */
 #ifndef CONFIG_CANTEEN_VOICE_TRACK_SUCCESS
@@ -69,8 +80,18 @@ typedef struct {
     bool overflow;
 } http_resp_t;
 
+typedef struct {
+    bool active;
+    int64_t started_us;
+    char id[TERMINAL_PENDING_ID_MAX + 1];
+} pending_item_t;
+
 static QueueHandle_t s_scan_queue;
 static long long s_last_transaction_id = -1;
+static portMUX_TYPE s_txid_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static pending_item_t s_pending_items[TERMINAL_PENDING_MAX];
+static SemaphoreHandle_t s_pending_lock;
 
 static void terminal_feedback(terminal_result_t result, bool play_voice)
 {
@@ -152,9 +173,10 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-/* 发送 POST；perform 成功时 http_status 返回 HTTP 状态码 */
-static esp_err_t terminal_http_post(const char *path, const char *body, int timeout_ms,
-                                    int *http_status, http_resp_t *resp)
+/* 发送请求；perform 成功时 http_status 返回 HTTP 状态码 */
+static esp_err_t terminal_http_request(esp_http_client_method_t method, const char *path,
+                                       const char *body, int timeout_ms, int *http_status,
+                                       http_resp_t *resp)
 {
     terminal_config_t cfg;
     terminal_config_get(&cfg);
@@ -162,7 +184,7 @@ static esp_err_t terminal_http_post(const char *path, const char *body, int time
         return ESP_ERR_INVALID_STATE;
     }
 
-    char url[TERMINAL_URL_MAX + 32];
+    char url[TERMINAL_URL_MAX + 128];
     int n = snprintf(url, sizeof(url), "%s%s", cfg.base_url, path);
     if (n < 0 || (size_t)n >= sizeof(url)) {
         return ESP_ERR_INVALID_SIZE;
@@ -183,7 +205,7 @@ static esp_err_t terminal_http_post(const char *path, const char *body, int time
 
     esp_http_client_config_t config = {
         .url = url,
-        .method = HTTP_METHOD_POST,
+        .method = method,
         .timeout_ms = timeout_ms,
         .event_handler = http_event_handler,
         .user_data = resp,
@@ -200,7 +222,7 @@ static esp_err_t terminal_http_post(const char *path, const char *body, int time
     if (err == ESP_OK) {
         err = esp_http_client_set_header(client, "Content-Type", "application/json");
     }
-    if (err == ESP_OK) {
+    if (err == ESP_OK && body != NULL) {
         err = esp_http_client_set_post_field(client, body, (int)strlen(body));
     }
     if (err == ESP_OK) {
@@ -212,6 +234,18 @@ static esp_err_t terminal_http_post(const char *path, const char *body, int time
 
     esp_http_client_cleanup(client);
     return err;
+}
+
+static esp_err_t terminal_http_post(const char *path, const char *body, int timeout_ms,
+                                    int *http_status, http_resp_t *resp)
+{
+    return terminal_http_request(HTTP_METHOD_POST, path, body, timeout_ms, http_status, resp);
+}
+
+static esp_err_t terminal_http_get(const char *path, int timeout_ms, int *http_status,
+                                   http_resp_t *resp)
+{
+    return terminal_http_request(HTTP_METHOD_GET, path, NULL, timeout_ms, http_status, resp);
 }
 
 static const char *json_string(const cJSON *root, const char *name)
@@ -235,6 +269,165 @@ static bool json_true(const cJSON *root, const char *name)
 static const char *or_dash(const char *s)
 {
     return (s != NULL && s[0] != '\0') ? s : "-";
+}
+
+static void pending_track(const char *id)
+{
+    size_t len = strlen(id);
+    if (len > TERMINAL_PENDING_ID_MAX) {
+        ESP_LOGW(TAG, "pending id is %u bytes (limit %d), final result polling disabled",
+                 (unsigned)len, TERMINAL_PENDING_ID_MAX);
+        return;
+    }
+
+    int slot = -1;
+    int oldest = 0;
+
+    xSemaphoreTake(s_pending_lock, portMAX_DELAY);
+    for (int i = 0; i < TERMINAL_PENDING_MAX; i++) {
+        if (!s_pending_items[i].active) {
+            if (slot < 0) {
+                slot = i;
+            }
+        } else if (strcmp(s_pending_items[i].id, id) == 0) {
+            /* 重复扫码返回同一个待确认请求：不重复跟踪 */
+            xSemaphoreGive(s_pending_lock);
+            return;
+        } else if (s_pending_items[i].started_us < s_pending_items[oldest].started_us) {
+            oldest = i;
+        }
+    }
+
+    if (slot < 0) {
+        /* 队列满：放弃跟踪最久的一条，避免新的扫码拿不到最终结果 */
+        slot = oldest;
+        ESP_LOGW(TAG, "pending queue full, stop polling %s", s_pending_items[slot].id);
+    }
+
+    s_pending_items[slot].active = true;
+    s_pending_items[slot].started_us = esp_timer_get_time();
+    memcpy(s_pending_items[slot].id, id, len + 1);
+    xSemaphoreGive(s_pending_lock);
+
+    ESP_LOGI(TAG, "polling pending %s every %d ms", id, TERMINAL_PENDING_QUERY_INTERVAL_MS);
+}
+
+static void pending_untrack(const char *id)
+{
+    xSemaphoreTake(s_pending_lock, portMAX_DELAY);
+    for (int i = 0; i < TERMINAL_PENDING_MAX; i++) {
+        if (s_pending_items[i].active && strcmp(s_pending_items[i].id, id) == 0) {
+            s_pending_items[i].active = false;
+            break;
+        }
+    }
+    xSemaphoreGive(s_pending_lock);
+}
+
+/* 查询单个待确认请求；拿到 SUCCESS/FAILED 后停止跟踪并播报最终结果 */
+static void pending_query(const char *id)
+{
+    char path[TERMINAL_PENDING_ID_MAX + 48];
+    int n = snprintf(path, sizeof(path), TERMINAL_PENDING_PATH "%s", id);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        pending_untrack(id);
+        return;
+    }
+
+    int http_status = 0;
+    http_resp_t resp;
+    esp_err_t err = terminal_http_get(path, TERMINAL_PENDING_QUERY_TIMEOUT_MS, &http_status, &resp);
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "pending %s: query failed (%s), will retry", id, esp_err_to_name(err));
+        return;
+    }
+    if (http_status != 200) {
+        ESP_LOGW(TAG, "pending %s: HTTP %d, will retry", id, http_status);
+        return;
+    }
+
+    cJSON *root = resp.data[0] != '\0' ? cJSON_Parse(resp.data) : NULL;
+    if (root == NULL) {
+        ESP_LOGW(TAG, "pending %s: invalid JSON response, will retry", id);
+        return;
+    }
+
+    const char *status = json_string(root, "status");
+    const char *code = json_string(root, "code");
+    const char *message = json_string(root, "message");
+
+    if (status != NULL && strcmp(status, "SUCCESS") == 0) {
+        long long txid = json_int(root, "transaction_id", -1);
+        ESP_LOGI(TAG,
+                 "pending %s confirmed: SUCCESS code=%s amount=%lld tx=%lld employee=%s meal=%s "
+                 "transaction_no=%s message=%s",
+                 id, or_dash(code), json_int(root, "amount_cents", -1), txid,
+                 or_dash(json_string(root, "employee_name")),
+                 or_dash(json_string(root, "meal_name")),
+                 or_dash(json_string(root, "transaction_no")), or_dash(message));
+
+        if (txid >= 0) {
+            portENTER_CRITICAL(&s_txid_lock);
+            s_last_transaction_id = txid;
+            portEXIT_CRITICAL(&s_txid_lock);
+        }
+        pending_untrack(id);
+        terminal_feedback(TERMINAL_RESULT_SUCCESS, true);
+    } else if (status != NULL && strcmp(status, "FAILED") == 0) {
+        ESP_LOGW(TAG, "pending %s finished: FAILED code=%s message=%s", id, or_dash(code),
+                 or_dash(message));
+        pending_untrack(id);
+        terminal_feedback(TERMINAL_RESULT_FAILED, true);
+    } else if (status != NULL && strcmp(status, "PENDING") == 0) {
+        ESP_LOGD(TAG, "pending %s still waiting for employee confirmation", id);
+    } else {
+        ESP_LOGW(TAG, "pending %s: unknown status=%s, will retry", id, or_dash(status));
+    }
+
+    cJSON_Delete(root);
+}
+
+static void terminal_pending_task(void *arg)
+{
+    (void)arg;
+
+    char current[TERMINAL_PENDING_MAX][TERMINAL_PENDING_ID_MAX + 1];
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(TERMINAL_PENDING_QUERY_INTERVAL_MS));
+
+        if (!wifi_prov_is_connected()) {
+            continue;
+        }
+        terminal_config_t cfg;
+        terminal_config_get(&cfg);
+        if (!terminal_config_is_complete(&cfg)) {
+            continue;
+        }
+
+        /* HTTP 请求不持锁：只把当前要查询的编号拷出来 */
+        int count = 0;
+        xSemaphoreTake(s_pending_lock, portMAX_DELAY);
+        for (int i = 0; i < TERMINAL_PENDING_MAX; i++) {
+            if (!s_pending_items[i].active) {
+                continue;
+            }
+            if (esp_timer_get_time() - s_pending_items[i].started_us >
+                TERMINAL_PENDING_MAX_DURATION_US) {
+                ESP_LOGW(TAG, "pending %s: no final result after %d s, stop polling (check phone)",
+                         s_pending_items[i].id, TERMINAL_PENDING_MAX_DURATION_US / 1000000);
+                s_pending_items[i].active = false;
+                continue;
+            }
+            memcpy(current[count], s_pending_items[i].id, sizeof(current[count]));
+            count++;
+        }
+        xSemaphoreGive(s_pending_lock);
+
+        for (int i = 0; i < count; i++) {
+            pending_query(current[i]);
+        }
+    }
 }
 
 static void handle_scan_response(int http_status, const http_resp_t *resp)
@@ -277,11 +470,14 @@ static void handle_scan_response(int http_status, const http_resp_t *resp)
         long long txid = json_int(root, "transaction_id", -1);
         bool replayed = json_true(root, "replayed");
         bool duplicate_trigger = json_true(root, "duplicate_trigger");
+
+        portENTER_CRITICAL(&s_txid_lock);
         bool duplicate = replayed || duplicate_trigger ||
                          (txid >= 0 && txid == s_last_transaction_id);
         if (txid >= 0) {
             s_last_transaction_id = txid;
         }
+        portEXIT_CRITICAL(&s_txid_lock);
 
         ESP_LOGI(TAG,
                  "scan SUCCESS code=%s amount=%lld tx=%lld duplicate=%d employee=%s meal=%s "
@@ -295,12 +491,17 @@ static void handle_scan_response(int http_status, const http_resp_t *resp)
         ESP_LOGW(TAG, "scan FAILED code=%s message=%s", or_dash(code), or_dash(message));
         terminal_feedback(TERMINAL_RESULT_FAILED, true);
     } else if (status != NULL && strcmp(status, "PENDING") == 0) {
-        /* 本次不实现待确认轮询：记录编号，提示员工在手机确认 */
+        const char *pending_id = json_string(root, "pending_id");
         ESP_LOGW(TAG,
                  "scan PENDING code=%s amount=%lld pending_id=%s expires_at=%s message=%s "
                  "(waiting for employee confirmation on phone)",
-                 or_dash(code), amount, or_dash(json_string(root, "pending_id")),
+                 or_dash(code), amount, or_dash(pending_id),
                  or_dash(json_string(root, "expires_at")), or_dash(message));
+        if (pending_id != NULL && pending_id[0] != '\0') {
+            pending_track(pending_id);
+        } else {
+            ESP_LOGW(TAG, "PENDING without pending_id: cannot poll for the final result");
+        }
         terminal_feedback(TERMINAL_RESULT_PENDING, true);
     } else {
         ESP_LOGW(TAG, "scan result unconfirmed: unknown status=%s code=%s",
@@ -516,12 +717,23 @@ esp_err_t terminal_init(void)
         }
     }
 
+    if (s_pending_lock == NULL) {
+        s_pending_lock = xSemaphoreCreateMutex();
+        if (s_pending_lock == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     if (xTaskCreate(terminal_scan_task, "term_scan", TERMINAL_SCAN_TASK_STACK, NULL,
                     TERMINAL_SCAN_TASK_PRIO, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     if (xTaskCreate(terminal_heartbeat_task, "term_hb", TERMINAL_HEARTBEAT_TASK_STACK, NULL,
                     TERMINAL_HEARTBEAT_TASK_PRIO, NULL) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (xTaskCreate(terminal_pending_task, "term_pending", TERMINAL_PENDING_TASK_STACK, NULL,
+                    TERMINAL_PENDING_TASK_PRIO, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
 

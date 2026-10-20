@@ -7,7 +7,7 @@
 - 上电 RGB 自检：红 → 绿 → 蓝 → 白，各 200 ms，之后由状态灯接管
 - WiFi 配网：无凭证时开启开放热点 `ESP32-Config`，手机连接后访问 `http://192.168.4.1` 配置 WiFi（支持强制门户自动弹出、扫描周边 WiFi），同时填写服务端地址和终端 key
 - 连接成功后保存凭证和终端配置到 NVS 并关闭配网热点；重启后自动连接路由器，掉线自动重连
-- 扫码上报：读取 `pmt_...` 就餐码后调用 `POST /api/v1/terminal/scan`，按 HTTP 状态和业务 `status`（`SUCCESS` / `FAILED` / `PENDING`）处理结果
+- 扫码上报：读取 `pmt_...` 就餐码后调用 `POST /api/v1/terminal/scan`，按 HTTP 状态和业务 `status`（`SUCCESS` / `FAILED` / `PENDING`）处理结果；`PENDING` 时轮询待确认请求直到拿到最终结果
 - 心跳：联网后立即发送一次，此后每 10 秒调用 `POST /api/v1/terminal/heartbeat`，上报扫码枪和语音模块状态
 - 结果反馈：成功绿灯、失败红灯、待确认黄灯慢闪、结果未确认红灯快闪；可选语音播报（曲目号由 Kconfig 配置，默认 2/4/1/3，设为 0 可不播报）
 - 运行中长按 **BOOT** 键 3 秒：清除配网信息并重启，重新进入配网模式（不清除终端配置）
@@ -113,7 +113,7 @@ Content-Type: application/json
 - 设备先判断 HTTP 状态码，再根据 JSON 的 `status` 处理；HTTP 200 不等于消费成功。
 - `SUCCESS`：记录金额和交易编号，绿灯 + 成功提示音；同一 `transaction_id` 或 `replayed` / `duplicate_trigger` 不重复播报。
 - `FAILED`：记录 `message`，红灯 + 失败提示音。
-- `PENDING`：记录 `pending_id` 和 `expires_at`，黄灯 + 待确认提示音。**本版本不轮询待确认结果**，员工在手机确认后以手机显示为准。
+- `PENDING`：记录 `pending_id` 和 `expires_at`，黄灯 + 待确认提示音，并每 2 秒查询 `GET /api/v1/terminal/pending/{pending_id}`；员工在手机确认后按最终 `SUCCESS` / `FAILED` 再播报一次。持续 10 分钟仍无最终结果时停止查询，并在日志中提示查看手机。
 - 断网、超时、HTTP 非 200、JSON 无法解析：红灯快闪 + “结果未确认”提示音；不显示“未扣款”，不自动重发或离线补扣。
 
 ### 心跳
@@ -203,7 +203,7 @@ Content-Type: application/json
 | 文件 | 职责 |
 | --- | --- |
 | [main/main.c](main/main.c) | 应用入口、按键/扫码枪/终端/配网初始化、BOOT 复位手势 |
-| [main/terminal.c](main/terminal.c) | 扫码队列、`/scan` 与 `/heartbeat` HTTP 客户端、结果解析、状态灯/语音反馈 |
+| [main/terminal.c](main/terminal.c) | 扫码队列、`/scan`、`/heartbeat` 与 `/pending/{id}` HTTP 客户端、待确认轮询、结果解析、状态灯/语音反馈 |
 | [main/terminal.h](main/terminal.h) | 终端客户端接口 |
 | [main/terminal_config.c](main/terminal_config.c) | 服务端地址与终端 key 的 NVS 读写、校验和内存缓存 |
 | [main/terminal_config.h](main/terminal_config.h) | 终端配置接口 |
@@ -292,7 +292,7 @@ idf.py -p COM8 flash monitor
 - 配网和联网使用 WiFi 射频，与 UART0/UART1、RGB LED 无引脚冲突；WiFi 发射瞬间电流较大，USB 供电较弱时建议增加储能电容。
 - 若设备已经联网但需要更换 WiFi，长按 **BOOT** 3 秒清除凭证并重启，无需拆机或重新烧录；终端配置（服务端地址/key）保留，可在配网页面修改。
 - 若更换开发板版本，需要确认 RGB LED 引脚（v1.0 = GPIO48，v1.1 = GPIO38）。
-- `PENDING` 只提示员工在手机确认，本版本不轮询 `/pending/{id}` 或 `/pending/recent`。
+- `PENDING` 时按 `pending_id` 每 2 秒查询 `/pending/{id}`，最多跟踪 4 条、持续 10 分钟；启动后的 `/pending/recent` 恢复查询未实现。
 - 扫码请求超时可能发生在服务端扣款之后，设备只提示“结果未确认”，不会自动重发或离线补扣。
 - 语音提示音会打断当前播放内容；四个曲目号默认 2/4/1/3，设为 0 即关闭播报，需保证编号与音频模块内的文件一致。
 - HTTPS 校验证书链和域名，但当前未开启 `CONFIG_MBEDTLS_HAVE_TIME_DATE`，不校验证书有效期。
