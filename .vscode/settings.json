@@ -26,7 +26,7 @@
     "--compile-commands-dir=d:\\Code\\esp32canteen\\01\\build"
   ],
   "idf.currentSetup": "C:\\esp\\v6.1\\esp-idf",
-  "idf.port": "COM9",
+  "idf.port": "COM12",
   "idf.flashType": "UART",
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"

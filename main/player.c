@@ -23,11 +23,16 @@
 #define CMD_PLAY_INDEX 0xA0
 #define CMD_PAUSE_RESUME 0xAA
 #define CMD_NEXT 0xAC
+#define CMD_VOLUME 0xAE
+#define CMD_QUERY_VOLUME 0xC1
 #define CMD_QUERY_STATUS 0xC2
 
 #define STATUS_PLAYING 0x01
 #define STATUS_STOPPED 0x02
 #define STATUS_PAUSED 0x03
+
+#define PLAYER_VOLUME_MAX 31
+#define PLAYER_VOLUME_DEFAULT 15
 
 /* 发送命令后的一小段时间内忽略状态回包，避免旧查询结果覆盖本地状态 */
 #define STATUS_IGNORE_US (300 * 1000)
@@ -36,7 +41,9 @@ static const char *TAG = "player";
 
 static volatile player_state_t s_state = PLAYER_STOPPED;
 static volatile int64_t s_ignore_status_before_us = 0;
+static volatile uint8_t s_volume = PLAYER_VOLUME_DEFAULT;
 static SemaphoreHandle_t s_status_reply_sem;
+static SemaphoreHandle_t s_volume_reply_sem;
 
 const char *player_state_name(player_state_t state)
 {
@@ -103,6 +110,11 @@ static void handle_frame(const uint8_t *body, uint8_t body_len)
             break;
         }
         xSemaphoreGive(s_status_reply_sem);
+    } else if (cmd == CMD_QUERY_VOLUME) {
+        if (body_len >= 2 && body[1] <= PLAYER_VOLUME_MAX) {
+            s_volume = body[1];
+        }
+        xSemaphoreGive(s_volume_reply_sem);
     } else {
         ESP_LOGD(TAG, "reply cmd=0x%02X", cmd);
     }
@@ -212,6 +224,10 @@ esp_err_t player_init(void)
     if (s_status_reply_sem == NULL) {
         return ESP_ERR_NO_MEM;
     }
+    s_volume_reply_sem = xSemaphoreCreateBinary();
+    if (s_volume_reply_sem == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
 
     if (xTaskCreate(player_rx_task, "player_rx", 3072, NULL, 10, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
@@ -227,6 +243,14 @@ esp_err_t player_init(void)
     } else {
         ESP_LOGW(TAG, "no reply from player, assume stopped");
         s_state = PLAYER_STOPPED;
+    }
+
+    /* 查询当前音量（模块掉电记忆音量，以模块返回值为准） */
+    send_cmd(CMD_QUERY_VOLUME, NULL, 0);
+    if (xSemaphoreTake(s_volume_reply_sem, pdMS_TO_TICKS(500)) == pdTRUE) {
+        ESP_LOGI(TAG, "volume: %u", s_volume);
+    } else {
+        ESP_LOGW(TAG, "no volume reply, assume %u", s_volume);
     }
 
     return ESP_OK;
@@ -268,4 +292,38 @@ void player_next(void)
     send_cmd(CMD_NEXT, NULL, 0);
     s_state = PLAYER_PLAYING;
     ESP_LOGI(TAG, "next");
+}
+
+uint8_t player_get_volume(void)
+{
+    return s_volume;
+}
+
+static void player_volume_set(uint8_t volume)
+{
+    if (volume == s_volume) {
+        return;
+    }
+
+    s_volume = volume;
+    send_cmd(CMD_VOLUME, &volume, 1);
+    ESP_LOGI(TAG, "volume: %u", s_volume);
+}
+
+void player_volume_up(void)
+{
+    if (s_volume >= PLAYER_VOLUME_MAX) {
+        ESP_LOGD(TAG, "volume already max");
+        return;
+    }
+    player_volume_set(s_volume + 1);
+}
+
+void player_volume_down(void)
+{
+    if (s_volume == 0) {
+        ESP_LOGD(TAG, "volume already min");
+        return;
+    }
+    player_volume_set(s_volume - 1);
 }

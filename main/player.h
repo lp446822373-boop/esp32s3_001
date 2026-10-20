@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -28,6 +30,21 @@ void player_toggle_play_pause(void);
  * @brief 下一首（会触发播放）
  */
 void player_next(void);
+
+/**
+ * @brief 音量加 1 级（0~31，超出范围不发送）
+ */
+void player_volume_up(void);
+
+/**
+ * @brief 音量减 1 级（0~31，超出范围不发送）
+ */
+void player_volume_down(void);
+
+/**
+ * @brief 当前音量（0~31）
+ */
+uint8_t player_get_volume(void);
 
 player_state_t player_get_state(void);
 
