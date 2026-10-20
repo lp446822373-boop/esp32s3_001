@@ -1,0 +1,32 @@
+menu "Canteen Terminal"
+
+    config CANTEEN_VOICE_TRACK_SUCCESS
+        int "SUCCESS 提示音曲目编号"
+        range 0 65535
+        default 2
+        help
+            扫码结果 SUCCESS 时播放的音频模块曲目编号，高字节在前发送。
+            0 表示不播放提示音。
+
+    config CANTEEN_VOICE_TRACK_FAILED
+        int "FAILED 提示音曲目编号"
+        range 0 65535
+        default 4
+        help
+            服务端返回 FAILED 时播放的曲目编号。
+
+    config CANTEEN_VOICE_TRACK_PENDING
+        int "PENDING 提示音曲目编号"
+        range 0 65535
+        default 1
+        help
+            服务端返回 PENDING、需要员工在手机确认时播放的曲目编号。
+
+    config CANTEEN_VOICE_TRACK_UNCONFIRMED
+        int "未确认提示音曲目编号"
+        range 0 65535
+        default 3
+        help
+            断网、超时、HTTP 异常或响应无法解析时播放的曲目编号。
+
+endmenu

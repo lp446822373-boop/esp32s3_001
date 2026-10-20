@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "led_strip.h"
@@ -21,6 +22,10 @@ static const char *TAG = "status_led";
 
 static led_strip_handle_t s_strip;
 static volatile status_led_mode_t s_mode = STATUS_LED_OFF;
+
+static portMUX_TYPE s_result_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile status_led_result_t s_result = STATUS_LED_RESULT_SUCCESS;
+static volatile int64_t s_result_end_us;
 
 static uint8_t s_last_r;
 static uint8_t s_last_g;
@@ -66,36 +71,72 @@ static void status_led_task(void *arg)
             elapsed = 0;
         }
 
-        switch (mode) {
-        case STATUS_LED_OFF:
-            led_write(0, 0, 0);
-            break;
-        case STATUS_LED_PROVISIONING:
-            /* 蓝色慢闪：500 ms 亮 / 500 ms 灭 */
-            on = ((elapsed / 5) % 2) == 0;
-            led_write(0, 0, on ? STATUS_LED_BRIGHTNESS : 0);
-            break;
-        case STATUS_LED_CONNECTING:
-            led_write(STATUS_LED_BRIGHTNESS, STATUS_LED_BRIGHTNESS / 3, 0);
-            break;
-        case STATUS_LED_CONNECTED:
-            /* 绿色亮 1.5 s 后熄灭，避免夜间常亮 */
-            led_write(0, elapsed <= 15 ? STATUS_LED_BRIGHTNESS : 0, 0);
-            break;
-        case STATUS_LED_RECONNECTING:
-            /* 橙色慢闪 */
-            on = ((elapsed / 5) % 2) == 0;
-            led_write(on ? STATUS_LED_BRIGHTNESS : 0,
-                      on ? STATUS_LED_BRIGHTNESS / 4 : 0, 0);
-            break;
-        case STATUS_LED_ERROR:
-            /* 红色快闪 */
-            on = (elapsed % 2) == 0;
-            led_write(on ? STATUS_LED_BRIGHTNESS : 0, 0, 0);
-            break;
-        default:
-            led_write(0, 0, 0);
-            break;
+        /* 扫码结果覆盖层优先显示，到期后回到 WiFi 状态 */
+        bool overlay = false;
+        status_led_result_t result = STATUS_LED_RESULT_SUCCESS;
+        int64_t remaining_us = 0;
+        portENTER_CRITICAL(&s_result_lock);
+        int64_t now_us = esp_timer_get_time();
+        if (now_us < s_result_end_us) {
+            overlay = true;
+            result = s_result;
+            remaining_us = s_result_end_us - now_us;
+        }
+        portEXIT_CRITICAL(&s_result_lock);
+
+        if (overlay) {
+            switch (result) {
+            case STATUS_LED_RESULT_SUCCESS:
+                led_write(0, STATUS_LED_BRIGHTNESS, 0);
+                break;
+            case STATUS_LED_RESULT_FAILED:
+                led_write(STATUS_LED_BRIGHTNESS, 0, 0);
+                break;
+            case STATUS_LED_RESULT_PENDING:
+                /* 黄色慢闪：250 ms 亮 / 250 ms 灭 */
+                on = ((remaining_us / 250000) % 2) == 0;
+                led_write(on ? STATUS_LED_BRIGHTNESS : 0,
+                          on ? STATUS_LED_BRIGHTNESS : 0, 0);
+                break;
+            case STATUS_LED_RESULT_UNCONFIRMED:
+            default:
+                /* 红色快闪：100 ms 亮 / 100 ms 灭 */
+                on = ((remaining_us / 100000) % 2) == 0;
+                led_write(on ? STATUS_LED_BRIGHTNESS : 0, 0, 0);
+                break;
+            }
+        } else {
+            switch (mode) {
+            case STATUS_LED_OFF:
+                led_write(0, 0, 0);
+                break;
+            case STATUS_LED_PROVISIONING:
+                /* 蓝色慢闪：500 ms 亮 / 500 ms 灭 */
+                on = ((elapsed / 5) % 2) == 0;
+                led_write(0, 0, on ? STATUS_LED_BRIGHTNESS : 0);
+                break;
+            case STATUS_LED_CONNECTING:
+                led_write(STATUS_LED_BRIGHTNESS, STATUS_LED_BRIGHTNESS / 3, 0);
+                break;
+            case STATUS_LED_CONNECTED:
+                /* 绿色亮 1.5 s 后熄灭，避免夜间常亮 */
+                led_write(0, elapsed <= 15 ? STATUS_LED_BRIGHTNESS : 0, 0);
+                break;
+            case STATUS_LED_RECONNECTING:
+                /* 橙色慢闪 */
+                on = ((elapsed / 5) % 2) == 0;
+                led_write(on ? STATUS_LED_BRIGHTNESS : 0,
+                          on ? STATUS_LED_BRIGHTNESS / 4 : 0, 0);
+                break;
+            case STATUS_LED_ERROR:
+                /* 红色快闪 */
+                on = (elapsed % 2) == 0;
+                led_write(on ? STATUS_LED_BRIGHTNESS : 0, 0, 0);
+                break;
+            default:
+                led_write(0, 0, 0);
+                break;
+            }
         }
 
         elapsed++;
@@ -136,4 +177,25 @@ esp_err_t status_led_init(void)
 void status_led_set_mode(status_led_mode_t mode)
 {
     s_mode = mode;
+}
+
+static int64_t result_duration_us(status_led_result_t result)
+{
+    switch (result) {
+    case STATUS_LED_RESULT_PENDING:
+        return 2000 * 1000;
+    case STATUS_LED_RESULT_SUCCESS:
+    case STATUS_LED_RESULT_FAILED:
+    case STATUS_LED_RESULT_UNCONFIRMED:
+    default:
+        return 1500 * 1000;
+    }
+}
+
+void status_led_show_result(status_led_result_t result)
+{
+    portENTER_CRITICAL(&s_result_lock);
+    s_result = result;
+    s_result_end_us = esp_timer_get_time() + result_duration_us(result);
+    portEXIT_CRITICAL(&s_result_lock);
 }

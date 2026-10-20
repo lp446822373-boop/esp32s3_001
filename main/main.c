@@ -10,6 +10,8 @@
 #include "player.h"
 #include "scanner.h"
 #include "status_led.h"
+#include "terminal.h"
+#include "terminal_config.h"
 #include "wifi_prov.h"
 
 /* 播放控制按键：GPIO4，低电平按下 */
@@ -110,11 +112,18 @@ void app_main(void)
     button_handle_t boot_btn_handle;
     ESP_ERROR_CHECK(button_create(&boot_btn, &boot_btn_handle));
 
-    /* 扫码枪数据打印到日志控制台 */
-    ESP_ERROR_CHECK(scanner_init(SCANNER_RX_GPIO, SCANNER_BAUD_RATE));
+    /* 终端配置（服务端地址 / key）必须在配网 HTTP 服务启动前加载 */
+    ESP_ERROR_CHECK(terminal_config_init());
+
+    /* 扫码枪：分帧后交给终端模块上报 */
+    ESP_ERROR_CHECK(scanner_init(SCANNER_RX_GPIO, SCANNER_BAUD_RATE,
+                                 terminal_on_scan_frame, NULL));
 
     /* WiFi：已保存凭证则直接联网，否则开启 ESP32-Config 配网热点 */
     ESP_ERROR_CHECK(wifi_prov_init());
+
+    /* 扫码上报与心跳任务（未配置时等待配网页面保存） */
+    ESP_ERROR_CHECK(terminal_init());
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));

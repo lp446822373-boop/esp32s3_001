@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -30,6 +31,18 @@ void player_toggle_play_pause(void);
  * @brief 下一首（会触发播放）
  */
 void player_next(void);
+
+/**
+ * @brief 播放指定曲目（1 起）,index 为 0 时不做任何操作
+ *
+ * 用于终端结果提示音；会打断当前播放内容。
+ */
+void player_play_track(uint16_t index);
+
+/**
+ * @brief 音频模块是否在本次上电后有过应答
+ */
+bool player_is_available(void);
 
 /**
  * @brief 音量加 1 级（0~31，超出范围不发送）

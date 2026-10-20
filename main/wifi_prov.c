@@ -24,6 +24,7 @@
 
 #include "prov_web.h"
 #include "status_led.h"
+#include "terminal_config.h"
 
 static const char *TAG = "wifi_prov";
 
@@ -197,7 +198,8 @@ static int url_decode(const char *src, char *dst, size_t dst_size)
 
 static esp_err_t get_form_value(const char *body, const char *key, char *val, size_t val_size)
 {
-    char raw[256];
+    /* 服务端地址可能被百分号编码，raw 需要比解码后的值大得多 */
+    char raw[768];
     esp_err_t err = httpd_query_key_value(body, key, raw, sizeof(raw));
     if (err != ESP_OK) {
         return err;
@@ -630,8 +632,14 @@ static void make_reason_message(int reason, char *buf, size_t size)
 
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
+    terminal_config_t cfg;
+    terminal_config_get(&cfg);
+
     char escaped_ssid[256];
     html_escape(s_cfg_ssid, escaped_ssid, sizeof(escaped_ssid));
+
+    char escaped_url[TERMINAL_URL_MAX * 6 + 1];
+    html_escape(cfg.base_url, escaped_url, sizeof(escaped_url));
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -639,10 +647,16 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     esp_err_t err = httpd_resp_sendstr_chunk(req, PROV_PAGE_HEAD);
     /*
      * 注意：空字符串会发送长度为 0 的分块，等同于结束 chunked 响应。
-     * 首次配网时预填 SSID 为空，必须跳过，否则页面会在 value=" 处被截断。
+     * 首次配网时预填 SSID / 服务端地址为空，必须跳过。
      */
     if (err == ESP_OK && escaped_ssid[0] != '\0') {
         err = httpd_resp_sendstr_chunk(req, escaped_ssid);
+    }
+    if (err == ESP_OK) {
+        err = httpd_resp_sendstr_chunk(req, PROV_PAGE_MID);
+    }
+    if (err == ESP_OK && escaped_url[0] != '\0') {
+        err = httpd_resp_sendstr_chunk(req, escaped_url);
     }
     if (err == ESP_OK) {
         err = httpd_resp_sendstr_chunk(req, PROV_PAGE_TAIL);
@@ -734,7 +748,7 @@ static esp_err_t scan_get_handler(httpd_req_t *req)
 
 static esp_err_t connect_post_handler(httpd_req_t *req)
 {
-    char body[512];
+    char body[1536];
     if (req->content_len == 0 || req->content_len >= sizeof(body)) {
         return send_error_page(req, "413 Payload Too Large", "提交的数据过大，请重试。");
     }
@@ -773,6 +787,33 @@ static esp_err_t connect_post_handler(httpd_req_t *req)
     if (pass_len > 0 && pass_len < 8) {
         return send_error_page(req, "400 Bad Request",
                                "WiFi 密码至少 8 位；开放网络请留空。");
+    }
+
+    /* 终端配置先于 WiFi 连接保存：即使 WiFi 连接失败，配置也不会丢失 */
+    char server[TERMINAL_URL_MAX + 1] = {0};
+    esp_err_t cfg_err = get_form_value(body, "server", server, sizeof(server));
+    if (cfg_err != ESP_OK && cfg_err != ESP_ERR_NOT_FOUND) {
+        return send_error_page(req, "400 Bad Request", "服务端地址无效，请重新输入。");
+    }
+
+    char key[TERMINAL_KEY_MAX + 1] = {0};
+    cfg_err = get_form_value(body, "key", key, sizeof(key));
+    if (cfg_err != ESP_OK && cfg_err != ESP_ERR_NOT_FOUND) {
+        return send_error_page(req, "400 Bad Request", "终端 key 无效，请重新输入。");
+    }
+
+    cfg_err = terminal_config_update(server, key);
+    if (cfg_err == ESP_ERR_INVALID_ARG) {
+        return send_error_page(req, "400 Bad Request",
+                               "服务端地址需以 http:// 或 https:// 开头；终端 key 需以 trm_ 开头。");
+    }
+    if (cfg_err == ESP_ERR_NOT_FOUND) {
+        return send_error_page(req, "400 Bad Request",
+                               "请填写服务端地址和终端 key（已配置的项目可留空保持不变）。");
+    }
+    if (cfg_err != ESP_OK) {
+        ESP_LOGE(TAG, "save terminal config failed: %s", esp_err_to_name(cfg_err));
+        return send_error_page(req, "500 Internal Server Error", "保存终端配置失败，请重试。");
     }
 
     ESP_LOGI(TAG, "connecting to \"%s\"...", ssid);

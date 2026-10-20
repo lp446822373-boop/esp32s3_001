@@ -1,13 +1,16 @@
 # esp32canteen / 01
 
-基于 **ESP32-S3-DevKitC-1** 的音频播放控制项目：通过板载按键控制串口音频模块的播放、暂停和切歌，并用板载 RGB LED 做状态指示与上电自检；支持手机网页配网，自动连接家中的 2.4 GHz WiFi。
+基于 **ESP32-S3-DevKitC-1** 的食堂终端项目：通过 TTL 串口扫码枪读取就餐码并上报服务端、定时发送心跳；同时通过板载按键控制串口音频模块的播放、暂停和切歌，用板载 RGB LED 和语音提示反馈扫码结果；支持手机网页配网并配置服务端地址与终端 key。
 
 ## 功能
 
 - 上电 RGB 自检：红 → 绿 → 蓝 → 白，各 200 ms，之后由状态灯接管
-- WiFi 配网：无凭证时开启开放热点 `ESP32-Config`，手机连接后访问 `http://192.168.4.1` 配置 WiFi（支持强制门户自动弹出、扫描周边 WiFi）
-- 连接成功后保存凭证到 NVS 并关闭配网热点；重启后自动连接路由器，掉线自动重连
-- 运行中长按 **BOOT** 键 3 秒：清除配网信息并重启，重新进入配网模式
+- WiFi 配网：无凭证时开启开放热点 `ESP32-Config`，手机连接后访问 `http://192.168.4.1` 配置 WiFi（支持强制门户自动弹出、扫描周边 WiFi），同时填写服务端地址和终端 key
+- 连接成功后保存凭证和终端配置到 NVS 并关闭配网热点；重启后自动连接路由器，掉线自动重连
+- 扫码上报：读取 `pmt_...` 就餐码后调用 `POST /api/v1/terminal/scan`，按 HTTP 状态和业务 `status`（`SUCCESS` / `FAILED` / `PENDING`）处理结果
+- 心跳：联网后立即发送一次，此后每 10 秒调用 `POST /api/v1/terminal/heartbeat`，上报扫码枪和语音模块状态
+- 结果反馈：成功绿灯、失败红灯、待确认黄灯慢闪、结果未确认红灯快闪；可选语音播报（曲目号由 Kconfig 配置，默认 2/4/1/3，设为 0 可不播报）
+- 运行中长按 **BOOT** 键 3 秒：清除配网信息并重启，重新进入配网模式（不清除终端配置）
 - RGB 状态指示：配网中蓝色慢闪、连接中黄色、连接成功绿色、掉线橙色慢闪、错误红色快闪
 - GPIO4 按键控制：
   - **短按**：播放 / 暂停切换
@@ -16,7 +19,7 @@
   - **短按**：音量减 1 级
   - **长按 0.8 秒**：音量加 1 级；按住不放时每 200 ms 继续加 1 级
 - 通过 UART0 与串口音频模块通信（115200 8N1），按模块协议组帧并校验
-- 通过 UART1 接收扫码枪数据（115200 8N1），按行结束符或 100 ms 空闲分帧，以日志形式打印文本和十六进制
+- 通过 UART1 接收扫码枪数据（115200 8N1），按行结束符或 100 ms 空闲分帧
 - 周期性查询播放器状态（每 2 秒），自动同步停止/播放/暂停状态
 - 日志输出到 USB Serial/JTAG，不占用协议串口和扫码串口
 
@@ -74,7 +77,79 @@ I (12345) scanner: scan #1 (13 bytes): 6901234567890 | 36 39 30 31 32 33 34 35 3
 - 一帧以 `\r` 或 `\n` 结束；
 - 若 100 ms 内没有新数据，已收到的内容也会作为一帧输出（兼容不带结束符的扫码枪）；
 - 单帧超过 256 字节会截断并给出 `truncated` 告警；
-- 十六进制超过 64 字节时只显示前 64 字节，以 `...` 结尾。
+- 十六进制超过 64 字节时只显示前 64 字节，以 `...` 结尾；
+- 分帧后会交给终端模块校验：只有以 `pmt_` 开头、不超过 128 字节且未被截断的内容才会上报服务端。
+
+## 服务端对接
+
+设备实现了扫码上报和心跳两个接口，协议细节见 [esp32-integration.md](esp32-integration.md)。
+
+### 配置
+
+配网页面在 WiFi 下方提供两项配置，保存到 NVS 命名空间 `terminal_cfg`：
+
+| 配置 | 说明 |
+| --- | --- |
+| 服务端地址 | 例如 `https://canteen.example.com`，不含 `/api/v1/...`；可带路径前缀，末尾斜杠会自动去掉 |
+| 终端 key | 后台“终端与扫码事件”中创建终端时获得，形如 `trm_...` |
+
+- 终端 key 保存在 NVS，不会回显到网页，也不会输出到日志。
+- 已配置时再次配网可将 key 留空保持不变；首次配置两项都必填。
+- 长按 BOOT 重新配网只清除 WiFi 凭证，终端配置保留。
+
+### 扫码上报
+
+扫码枪读到以 `pmt_` 开头的完整就餐码后：
+
+```http
+POST {服务端地址}/api/v1/terminal/scan
+Authorization: Bearer trm_...
+Content-Type: application/json
+
+{"token":"pmt_..."}
+```
+
+- 单帧超过 128 字节、被截断、不是 `pmt_` 前缀或含控制字符时整条丢弃，不截断上报。
+- 设备先判断 HTTP 状态码，再根据 JSON 的 `status` 处理；HTTP 200 不等于消费成功。
+- `SUCCESS`：记录金额和交易编号，绿灯 + 成功提示音；同一 `transaction_id` 或 `replayed` / `duplicate_trigger` 不重复播报。
+- `FAILED`：记录 `message`，红灯 + 失败提示音。
+- `PENDING`：记录 `pending_id` 和 `expires_at`，黄灯 + 待确认提示音。**本版本不轮询待确认结果**，员工在手机确认后以手机显示为准。
+- 断网、超时、HTTP 非 200、JSON 无法解析：红灯快闪 + “结果未确认”提示音；不显示“未扣款”，不自动重发或离线补扣。
+
+### 心跳
+
+联网后立即发送一次，此后每 10 秒：
+
+```http
+POST {服务端地址}/api/v1/terminal/heartbeat
+Authorization: Bearer trm_...
+Content-Type: application/json
+
+{"scanner_status":"READY","voice_status":"READY"}
+```
+
+`voice_status` 在音频模块从未应答时为 `UNAVAILABLE`。心跳成功只代表设备在线，不代表任何消费成功。
+
+### HTTPS 与超时
+
+- 支持 `http://` 和 `https://`；HTTPS 使用 ESP-IDF 内置 CA 证书包校验证书链和域名，应填写与证书 CN/SAN 一致的主机名，不要用 IP。
+- 当前配置未开启 `CONFIG_MBEDTLS_HAVE_TIME_DATE`，ESP-IDF 默认不校验证书有效期。
+- 扫码请求超时 10 秒，心跳超时 5 秒；扫码请求不自动重试。
+
+### 语音提示音
+
+在 `idf.py menuconfig` → `Canteen Terminal` 中配置四个曲目编号（0 表示不播报，默认值见下表）：
+
+| 配置项 | 触发条件 | 默认曲目号 |
+| --- | --- | --- |
+| `CANTEEN_VOICE_TRACK_SUCCESS` | 服务端返回 `SUCCESS` | 2 |
+| `CANTEEN_VOICE_TRACK_FAILED` | 服务端返回 `FAILED` | 4 |
+| `CANTEEN_VOICE_TRACK_PENDING` | 服务端返回 `PENDING` | 1 |
+| `CANTEEN_VOICE_TRACK_UNCONFIRMED` | 断网、超时、HTTP 异常或响应无法解析 | 3 |
+
+曲目编号必须与音频模块存储介质中的文件编号一致，否则模块不会发声。
+
+提示音通过音频模块按曲目号播放，会打断当前播放内容。曲目需提前存放在音频模块的存储介质中。
 
 ## WiFi 配网
 
@@ -82,15 +157,16 @@ I (12345) scanner: scan #1 (13 bytes): 6901234567890 | 36 39 30 31 32 33 34 35 3
 
 1. 上电后若 NVS 中没有 WiFi 凭证（或启动时连接路由器失败），设备开启开放热点 **ESP32-Config**（无密码）。
 2. 手机连接该热点。iOS / Android 通常会自动弹出配网页；若没有弹出，请用浏览器打开 <http://192.168.4.1>。
-3. 点击「扫描」选择周边 WiFi，或手动输入 SSID；输入密码（开放网络留空），点击「连接」。
-4. 设备尝试连接路由器，最长等待 15 秒：
+3. 点击「扫描」选择周边 WiFi，或手动输入 SSID；输入密码（开放网络留空），再填写服务端地址和终端 key（已配置时可留空保持不变），点击「保存并连接」。
+4. 设备先保存终端配置，再尝试连接路由器，最长等待 15 秒：
    - **成功**：页面提示连接成功，2 秒后自动关闭配网热点，设备以 STA 模式运行；
-   - **失败**：页面显示具体原因（找不到 AP、密码错误、连接超时等），热点保持开启，可直接重试。
+   - **失败**：页面显示具体原因（找不到 AP、密码错误、连接超时等），热点保持开启，可直接重试；终端配置已保存，不会丢失。
 
 ### 行为说明
 
 - 仅支持 **2.4 GHz** WiFi；输入 5 GHz SSID 会提示找不到 AP。
 - 凭证保存在 NVS 命名空间 `wifi_cfg`（键 `ssid` / `pass`），**只有连接成功后**才写入。
+- 终端配置保存在 NVS 命名空间 `terminal_cfg`（键 `url` / `key`），提交表单时即写入，与 WiFi 是否连接成功无关。
 - 已保存凭证时上电先尝试连接；15 秒内失败则自动开启配网热点（旧凭证保留在表单中预填）。
 - 连接期间使用 APSTA 模式，手机可以保持在配网热点上等待结果；成功后关闭热点。
 - 运行中掉线每 5 秒自动重连。
@@ -99,7 +175,7 @@ I (12345) scanner: scan #1 (13 bytes): 6901234567890 | 36 39 30 31 32 33 34 35 3
 
 ### 重新配网
 
-设备运行中长按 **BOOT** 键 3 秒，串口日志会提示清除 WiFi 凭证；**松开 BOOT 后**设备自动重启并进入配网模式（等待松开是为了避免触发下载模式）。
+设备运行中长按 **BOOT** 键 3 秒，串口日志会提示清除 WiFi 凭证；**松开 BOOT 后**设备自动重启并进入配网模式（等待松开是为了避免触发下载模式）。重新配网时服务端地址会预填、终端 key 留空保持不变，可在页面上修改终端配置。
 
 > BOOT 是 ESP32-S3 的下载模式 strapping 引脚：**上电/复位瞬间按住会进入串口下载模式，应用不会启动**。请在上电完成后再长按。
 
@@ -113,30 +189,44 @@ I (12345) scanner: scan #1 (13 bytes): 6901234567890 | 36 39 30 31 32 33 34 35 3
 | 橙色慢闪 | 联网后掉线，正在重连 |
 | 红色快闪 | 初始化失败或正在清除配置 |
 
+扫码结果会临时覆盖状态灯，显示完自动恢复上面的 WiFi 状态：
+
+| 颜色 | 含义 |
+| --- | --- |
+| 绿色常亮 1.5 s | 消费成功 |
+| 红色常亮 1.5 s | 消费失败，或扫码内容不是有效就餐码 |
+| 黄色慢闪 2 s | 需要员工在手机确认再次消费 |
+| 红色快闪 1.5 s | 结果未确认（断网、超时、HTTP 异常或响应无法解析） |
+
 ## 软件架构
 
 | 文件 | 职责 |
 | --- | --- |
-| [main/main.c](main/main.c) | 应用入口、按键/扫码枪/配网初始化、BOOT 复位手势 |
+| [main/main.c](main/main.c) | 应用入口、按键/扫码枪/终端/配网初始化、BOOT 复位手势 |
+| [main/terminal.c](main/terminal.c) | 扫码队列、`/scan` 与 `/heartbeat` HTTP 客户端、结果解析、状态灯/语音反馈 |
+| [main/terminal.h](main/terminal.h) | 终端客户端接口 |
+| [main/terminal_config.c](main/terminal_config.c) | 服务端地址与终端 key 的 NVS 读写、校验和内存缓存 |
+| [main/terminal_config.h](main/terminal_config.h) | 终端配置接口 |
+| [main/Kconfig.projbuild](main/Kconfig.projbuild) | 语音提示音曲目编号配置 |
 | [main/player.c](main/player.c) | UART0 初始化、协议组帧/校验、回包解析、播放状态与音量控制 |
 | [main/player.h](main/player.h) | 播放器接口 |
 | [main/button.c](main/button.c) | 多实例按键轮询、消抖、短按/长按/连发识别 |
 | [main/button.h](main/button.h) | 按键接口 |
-| [main/scanner.c](main/scanner.c) | UART1 扫码枪接收、分帧与日志输出 |
+| [main/scanner.c](main/scanner.c) | UART1 扫码枪接收、分帧、日志输出与分帧回调 |
 | [main/scanner.h](main/scanner.h) | 扫码枪接口 |
 | [main/wifi_prov.c](main/wifi_prov.c) | WiFi 初始化、STA 连接/重连、SoftAP 配网、HTTP 服务、强制门户 DNS、NVS 凭证 |
 | [main/wifi_prov.h](main/wifi_prov.h) | 配网接口 |
 | [main/prov_web.h](main/prov_web.h) | 内嵌配网页、成功页、错误页 HTML |
-| [main/status_led.c](main/status_led.c) | RGB 自检与状态灯任务 |
+| [main/status_led.c](main/status_led.c) | RGB 自检、状态灯任务与扫码结果覆盖层 |
 | [main/status_led.h](main/status_led.h) | 状态灯接口与颜色定义 |
-| [main/idf_component.yml](main/idf_component.yml) | 组件依赖（`espressif/led_strip`） |
+| [main/idf_component.yml](main/idf_component.yml) | 组件依赖（`espressif/led_strip`、`espressif/cjson`） |
 | [docs/audio-player.md](docs/audio-player.md) | 串口音频模块协议参考 |
 
 ## 环境要求
 
 - ESP-IDF **v6.1**
 - 目标芯片：**esp32s3**
-- Python 依赖由 ESP-IDF 环境提供；`led_strip` 组件由组件管理器自动下载
+- Python 依赖由 ESP-IDF 环境提供；`led_strip` 和 `cjson` 组件由组件管理器自动下载
 
 ## 构建与烧录
 
@@ -154,7 +244,7 @@ idf.py -p COM8 flash monitor
 
 - 端口号按实际设备修改；本项目日志控制台已配置为 **USB Serial/JTAG**（`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`），因此建议使用板子的 USB 原生口。
 - 不要使用 UART 口查看日志：UART0 已用于连接音频模块，UART1 已用于扫码枪。扫码数据和系统日志都从 USB Serial/JTAG 输出。
-- 首次构建需要联网下载 `espressif/led_strip` 组件。
+- 首次构建需要联网下载 `espressif/led_strip` 和 `espressif/cjson` 组件。
 - 首次生成 `sdkconfig` 时会应用 [sdkconfig.defaults](sdkconfig.defaults)，把应用分区切到 1500 KB（`Single factory app (large)`），以容纳 WiFi/HTTP 功能。
 
 ### 日志口说明（DevKitC-1 有两个 USB 口）
@@ -174,8 +264,11 @@ idf.py -p COM8 flash monitor
 ├── CMakeLists.txt
 ├── main/
 │   ├── CMakeLists.txt
+│   ├── Kconfig.projbuild
 │   ├── idf_component.yml
 │   ├── main.c
+│   ├── terminal.c / terminal.h
+│   ├── terminal_config.c / terminal_config.h
 │   ├── player.c / player.h
 │   ├── button.c / button.h
 │   ├── scanner.c / scanner.h
@@ -184,6 +277,7 @@ idf.py -p COM8 flash monitor
 │   └── status_led.c / status_led.h
 ├── docs/
 │   └── audio-player.md
+├── esp32-integration.md
 ├── sdkconfig.defaults
 └── README.md
 ```
@@ -196,10 +290,16 @@ idf.py -p COM8 flash monitor
 - 扫码枪只接 RX（GPIO18）；若实际接线使用其他引脚，修改 [main/main.c](main/main.c) 中的 `SCANNER_RX_GPIO`。
 - 配网热点为**开放网络**（无密码），仅在未配置或连接失败时开启，配网完成后自动关闭。
 - 配网和联网使用 WiFi 射频，与 UART0/UART1、RGB LED 无引脚冲突；WiFi 发射瞬间电流较大，USB 供电较弱时建议增加储能电容。
-- 若设备已经联网但需要更换 WiFi，长按 **BOOT** 3 秒清除凭证并重启，无需拆机或重新烧录。
+- 若设备已经联网但需要更换 WiFi，长按 **BOOT** 3 秒清除凭证并重启，无需拆机或重新烧录；终端配置（服务端地址/key）保留，可在配网页面修改。
 - 若更换开发板版本，需要确认 RGB LED 引脚（v1.0 = GPIO48，v1.1 = GPIO38）。
+- `PENDING` 只提示员工在手机确认，本版本不轮询 `/pending/{id}` 或 `/pending/recent`。
+- 扫码请求超时可能发生在服务端扣款之后，设备只提示“结果未确认”，不会自动重发或离线补扣。
+- 语音提示音会打断当前播放内容；四个曲目号默认 2/4/1/3，设为 0 即关闭播报，需保证编号与音频模块内的文件一致。
+- HTTPS 校验证书链和域名，但当前未开启 `CONFIG_MBEDTLS_HAVE_TIME_DATE`，不校验证书有效期。
+- 串口日志会打印完整扫码内容（含就餐码），终端 key 不会出现在日志中。
 
 ## 相关文档
 
+- [终端接口对接文档](esp32-integration.md)
 - [串口音频模块协议参考](docs/audio-player.md)
 - [ESP32-S3-DevKitC-1 用户指南](https://docs.espressif.com/projects/esp-dev-kits/zh_CN/latest/esp32s3/esp32-s3-devkitc-1/user_guide_v1.1.html)

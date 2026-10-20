@@ -16,6 +16,9 @@
 
 static const char *TAG = "scanner";
 
+static scanner_frame_cb_t s_on_frame;
+static void *s_on_frame_ctx;
+
 /*
  * 一次扫码只打印一行日志：文本（不可打印字符替换为 '.'）+ 十六进制。
  * 超过 SCANNER_HEX_MAX 字节时只打印前 SCANNER_HEX_MAX 字节的十六进制。
@@ -56,6 +59,10 @@ static void scanner_report(const uint8_t *data, uint32_t len, bool truncated)
         ESP_LOGI(TAG, "scan #%u (%u bytes): %s | %s",
                  scan_count, len, text, hex);
     }
+
+    if (s_on_frame != NULL) {
+        s_on_frame(data, len, truncated, s_on_frame_ctx);
+    }
 }
 
 static void scanner_rx_task(void *arg)
@@ -95,8 +102,12 @@ static void scanner_rx_task(void *arg)
     }
 }
 
-esp_err_t scanner_init(gpio_num_t rx_gpio, uint32_t baud_rate)
+esp_err_t scanner_init(gpio_num_t rx_gpio, uint32_t baud_rate,
+                       scanner_frame_cb_t on_frame, void *ctx)
 {
+    s_on_frame = on_frame;
+    s_on_frame_ctx = ctx;
+
     uart_config_t uart_cfg = {
         .baud_rate = (int)baud_rate,
         .data_bits = UART_DATA_8_BITS,

@@ -3,15 +3,16 @@
 /*
  * 配网页面静态资源。
  *
- * PROV_PAGE_HEAD + 已转义的 SSID + PROV_PAGE_TAIL 组成配置首页；
- * 错误页由 PROV_ERR_HEAD + 错误原因 + PROV_ERR_TAIL 组成。
+ * PROV_PAGE_HEAD + 已转义的 SSID + PROV_PAGE_MID + 已转义的服务端地址
+ * + PROV_PAGE_TAIL 组成配置首页；错误页由 PROV_ERR_HEAD + 错误原因 +
+ * PROV_ERR_TAIL 组成。
  */
 
 static const char PROV_PAGE_HEAD[] =
     "<!DOCTYPE html>\n"
     "<html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-    "<title>WiFi 配置</title><style>"
+    "<title>设备配置</title><style>"
     "*{box-sizing:border-box}"
     "body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;"
     "padding:16px;background:#f2f4f7;color:#1f2933;"
@@ -42,15 +43,15 @@ static const char PROV_PAGE_HEAD[] =
     ".rssi{color:#98a2b3;font-size:12px;white-space:nowrap}"
     "footer{margin-top:18px;text-align:center;font-size:12px;color:#98a2b3}"
     "</style></head><body><div class=\"card\">"
-    "<h1>WiFi 配置</h1>"
-    "<p class=\"sub\">选择或输入家中的 WiFi，设备会自动连接。</p>"
+    "<h1>设备配置</h1>"
+    "<p class=\"sub\">配置 WiFi 和食堂服务端，保存后设备会自动连接。</p>"
     "<form id=\"f\" method=\"post\" action=\"/connect\">"
     "<label for=\"ssid\">WiFi 名称</label>"
     "<div class=\"row\">"
     "<input id=\"ssid\" name=\"ssid\" maxlength=\"32\" required autocomplete=\"off\" "
     "autocapitalize=\"off\" spellcheck=\"false\" value=\"";
 
-static const char PROV_PAGE_TAIL[] =
+static const char PROV_PAGE_MID[] =
     "\">"
     "<button type=\"button\" class=\"secondary\" id=\"scan\">扫描</button>"
     "</div>"
@@ -58,8 +59,20 @@ static const char PROV_PAGE_TAIL[] =
     "<label for=\"pass\">密码</label>"
     "<input id=\"pass\" name=\"pass\" type=\"password\" maxlength=\"64\" autocomplete=\"off\" "
     "placeholder=\"开放网络请留空\">"
+    "<label for=\"server\">服务端地址</label>"
+    "<input id=\"server\" name=\"server\" maxlength=\"160\" required autocomplete=\"off\" "
+    "autocapitalize=\"off\" spellcheck=\"false\" "
+    "placeholder=\"https://canteen.example.com\" value=\"";
+
+static const char PROV_PAGE_TAIL[] =
+    "\">"
+    "<label for=\"key\">终端 key</label>"
+    "<input id=\"key\" name=\"key\" type=\"password\" maxlength=\"96\" autocomplete=\"off\" "
+    "placeholder=\"trm_...（已配置时留空保持不变）\">"
+    "<p class=\"hint\">服务端地址填到网站根路径，不含 /api/v1/...；可带路径前缀，"
+    "HTTPS 需使用证书对应的域名。终端 key 在管理后台“终端与扫码事件”中创建。</p>"
     "<p class=\"hint\">仅支持 2.4 GHz WiFi。提交后请等待最多 15 秒，不要关闭本页面。</p>"
-    "<button type=\"submit\" id=\"submit\" class=\"primary\">连接</button>"
+    "<button type=\"submit\" id=\"submit\" class=\"primary\">保存并连接</button>"
     "<div id=\"msg\" class=\"msg\"></div>"
     "</form>"
     "<footer>配网热点：ESP32-Config</footer>"
