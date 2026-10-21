@@ -296,6 +296,31 @@ bool wifi_prov_is_connected(void)
     return s_connected;
 }
 
+wifi_prov_state_t wifi_prov_get_state(void)
+{
+    return (wifi_prov_state_t)s_state;
+}
+
+bool wifi_prov_get_rssi(int8_t *rssi)
+{
+    if (rssi == NULL || !s_connected) {
+        return false;
+    }
+
+    wifi_ap_record_t ap = {0};
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {
+        return false;
+    }
+
+    *rssi = ap.rssi;
+    return true;
+}
+
+const char *wifi_prov_get_ssid(void)
+{
+    return s_cfg_ssid;
+}
+
 /* ---------- DNS 强制门户 ---------- */
 
 static int build_dns_response(const uint8_t *query, int qlen, uint8_t *resp, int rsize)

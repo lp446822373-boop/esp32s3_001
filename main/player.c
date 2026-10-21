@@ -43,6 +43,7 @@ static volatile player_state_t s_state = PLAYER_STOPPED;
 static volatile int64_t s_ignore_status_before_us = 0;
 static volatile uint8_t s_volume = PLAYER_VOLUME_DEFAULT;
 static volatile bool s_available;
+static volatile int64_t s_last_reply_us;
 static SemaphoreHandle_t s_status_reply_sem;
 static SemaphoreHandle_t s_volume_reply_sem;
 
@@ -67,6 +68,11 @@ player_state_t player_get_state(void)
 bool player_is_available(void)
 {
     return s_available;
+}
+
+int64_t player_get_last_reply_us(void)
+{
+    return s_last_reply_us;
 }
 
 static void send_cmd(uint8_t cmd, const uint8_t *params, uint8_t param_len)
@@ -96,6 +102,7 @@ static void handle_frame(const uint8_t *body, uint8_t body_len)
     }
 
     s_available = true;
+    s_last_reply_us = esp_timer_get_time();
     uint8_t cmd = body[0];
 
     if (cmd == CMD_QUERY_STATUS) {
@@ -205,6 +212,7 @@ static void player_poll_task(void *arg)
 esp_err_t player_init(void)
 {
     s_available = false;
+    s_last_reply_us = 0;
 
     uart_config_t uart_cfg = {
         .baud_rate = PLAYER_BAUD_RATE,

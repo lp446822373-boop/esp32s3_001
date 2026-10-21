@@ -7,6 +7,7 @@
 #include "freertos/task.h"
 
 #include "button.h"
+#include "display.h"
 #include "player.h"
 #include "scanner.h"
 #include "status_led.h"
@@ -81,6 +82,16 @@ void app_main(void)
 {
     /* RGB 上电自检（红、绿、蓝、白各 200 ms），随后由状态灯任务接管 */
     ESP_ERROR_CHECK(status_led_init());
+
+    /*
+     * OLED 属于可选外设：初始化失败只记录日志。
+     * 屏幕未接、地址不对或接线有问题时，扫码、联网和语音仍须正常工作。
+     */
+    esp_err_t display_err = display_init();
+    if (display_err != ESP_OK) {
+        ESP_LOGW(TAG, "display unavailable (%s), running without screen",
+                 esp_err_to_name(display_err));
+    }
 
     /* 短按：播放/暂停；长按：下一首 */
     ESP_ERROR_CHECK(player_init());

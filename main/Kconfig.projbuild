@@ -29,4 +29,45 @@ menu "Canteen Terminal"
         help
             断网、超时、HTTP 异常或响应无法解析时播放的曲目编号。
 
+    config CANTEEN_DISPLAY_ENABLE
+        bool "启用 I2C OLED 显示屏"
+        default y
+        help
+            启用后初始化 SSD1306 OLED 并在后台刷新界面。
+            屏幕属于可选外设，初始化失败不会影响扫码、联网和语音。
+
+    config CANTEEN_DISPLAY_I2C_SDA_GPIO
+        int "OLED I2C SDA GPIO"
+        range 0 48
+        default 8
+
+    config CANTEEN_DISPLAY_I2C_SCL_GPIO
+        int "OLED I2C SCL GPIO"
+        range 0 48
+        default 9
+
+    config CANTEEN_DISPLAY_I2C_ADDR
+        hex "OLED I2C 地址"
+        default 0x3C
+
+    config CANTEEN_DISPLAY_HEIGHT
+        int "OLED 行数"
+        range 32 64
+        default 64
+
+    config CANTEEN_DISPLAY_CONTRAST
+        int "OLED 对比度"
+        range 1 255
+        default 128
+
+    config CANTEEN_DISPLAY_RESULT_HOLD_MS
+        int "扫码结果页停留时间（毫秒）"
+        range 1000 60000
+        default 5000
+
+    config CANTEEN_DISPLAY_SCROLL_MS
+        int "长信息滚动间隔（毫秒）"
+        range 20 2000
+        default 100
+
 endmenu

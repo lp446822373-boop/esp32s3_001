@@ -5,6 +5,7 @@
 
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -18,6 +19,36 @@ static const char *TAG = "scanner";
 
 static scanner_frame_cb_t s_on_frame;
 static void *s_on_frame_ctx;
+
+static portMUX_TYPE s_stats_lock = portMUX_INITIALIZER_UNLOCKED;
+static scanner_stats_t s_stats;
+
+void scanner_get_stats(scanner_stats_t *stats)
+{
+    if (stats == NULL) {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_stats_lock);
+    *stats = s_stats;
+    portEXIT_CRITICAL(&s_stats_lock);
+}
+
+/* 在 RX 任务中每个字节调用一次 */
+static void scanner_stats_on_byte(void)
+{
+    portENTER_CRITICAL(&s_stats_lock);
+    s_stats.bytes++;
+    s_stats.last_rx_us = esp_timer_get_time();
+    portEXIT_CRITICAL(&s_stats_lock);
+}
+
+static void scanner_stats_on_frame(void)
+{
+    portENTER_CRITICAL(&s_stats_lock);
+    s_stats.frames++;
+    portEXIT_CRITICAL(&s_stats_lock);
+}
 
 /*
  * 一次扫码只打印一行日志：文本（不可打印字符替换为 '.'）+ 十六进制。
@@ -52,6 +83,7 @@ static void scanner_report(const uint8_t *data, uint32_t len, bool truncated)
     hex[pos] = '\0';
 
     scan_count++;
+    scanner_stats_on_frame();
     if (truncated) {
         ESP_LOGW(TAG, "scan #%u (%u bytes, truncated): %s | %s",
                  scan_count, len, text, hex);
@@ -77,6 +109,7 @@ static void scanner_rx_task(void *arg)
                                 pdMS_TO_TICKS(SCANNER_IDLE_MS));
 
         if (n == 1) {
+            scanner_stats_on_byte();
             if (byte == '\r' || byte == '\n') {
                 if (len > 0 || truncated) {
                     scanner_report(frame, len, truncated);
@@ -134,6 +167,10 @@ esp_err_t scanner_init(gpio_num_t rx_gpio, uint32_t baud_rate,
     if (xTaskCreate(scanner_rx_task, "scanner", 3072, NULL, 9, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
+
+    portENTER_CRITICAL(&s_stats_lock);
+    s_stats.uart_ready = true;
+    portEXIT_CRITICAL(&s_stats_lock);
 
     ESP_LOGI(TAG, "UART%d RX=GPIO%d @ %u 8N1", SCANNER_UART_NUM, rx_gpio,
              (unsigned)baud_rate);

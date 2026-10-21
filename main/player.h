@@ -45,6 +45,13 @@ void player_play_track(uint16_t index);
 bool player_is_available(void);
 
 /**
+ * @brief 最后收到模块应答的时间（微秒），0 表示上电后从未收到
+ *
+ * 模块每 2 秒会被查询一次状态，可用于判断当前是否在线。
+ */
+int64_t player_get_last_reply_us(void);
+
+/**
  * @brief 音量加 1 级（0~31，超出范围不发送）
  */
 void player_volume_up(void);

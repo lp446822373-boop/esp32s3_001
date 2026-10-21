@@ -21,6 +21,19 @@ typedef void (*scanner_frame_cb_t)(const uint8_t *data, size_t len,
                                    bool truncated, void *ctx);
 
 /**
+ * @brief 扫码枪接收统计
+ *
+ * 扫码枪只向外发送数据，不扫码时总线上没有任何内容，因此无法据此判断
+ * 设备是否故障；last_rx_us 只能说明最近一次收到数据的时间。
+ */
+typedef struct {
+    bool uart_ready;      /* UART 初始化成功 */
+    uint32_t frames;      /* 完整帧数 */
+    uint32_t bytes;       /* 累计接收字节数 */
+    int64_t last_rx_us;   /* 最后收到字节的时间，0 表示从未收到 */
+} scanner_stats_t;
+
+/**
  * @brief 初始化扫码枪串口（UART1，只接收）
  *
  * 扫码数据通过 ESP_LOGI 打印到日志控制台，并回调 on_frame（可为 NULL）。
@@ -33,6 +46,11 @@ typedef void (*scanner_frame_cb_t)(const uint8_t *data, size_t len,
  */
 esp_err_t scanner_init(gpio_num_t rx_gpio, uint32_t baud_rate,
                        scanner_frame_cb_t on_frame, void *ctx);
+
+/**
+ * @brief 读取接收统计（任意任务可调用）
+ */
+void scanner_get_stats(scanner_stats_t *stats);
 
 #ifdef __cplusplus
 }
